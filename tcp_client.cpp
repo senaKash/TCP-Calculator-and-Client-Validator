@@ -7,11 +7,14 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <random>
 #include <sstream>
+#include <stack>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -25,37 +28,79 @@ int set_nonblocking(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+// Возвращает приоритет оператора
+int precedence(char op) {
+    if (op == '+' || op == '-') return 1;
+    if (op == '*' || op == '/') return 2;
+    return 0;
+}
+
+// Применяет оператор op к значениям a и b
+long apply_op(long a, long b, char op) {
+    switch (op) {
+        case '+': return a + b;
+        case '-': return a - b;
+        case '*': return a * b;
+        case '/':
+            return b == 0 ? 0 : a / b;  // в клиенте на деление на ноль — 0
+    }
+    throw std::runtime_error("Unknown operator");
+}
+
+// Локальное вычисление выражения (shunting‑yard)
+long evaluate(const std::string& s) {
+    std::stack<long> values;  // стек для чисел
+    std::stack<char> ops;     // стек для операторов
+
+    for (size_t i = 0; i < s.size(); ) {
+        if (std::isspace(static_cast<unsigned char>(s[i]))) {
+            ++i;
+        }
+        else if (std::isdigit(static_cast<unsigned char>(s[i]))) {
+            // читаем целое число
+            long val = 0;
+            while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) {
+                val = val * 10 + (s[i++] - '0');
+            }
+            values.push(val);
+        }
+        else {
+            // текущий символ — оператор
+            char op = s[i++];
+            // пока в стеке ops есть оператор с приоритетом >= текущего
+            while (!ops.empty() && precedence(ops.top()) >= precedence(op)) {
+                long b = values.top(); values.pop();
+                long a = values.top(); values.pop();
+                char top_op = ops.top(); ops.pop();
+                values.push(apply_op(a, b, top_op));
+            }
+            ops.push(op);
+        }
+    }
+
+    // применяем оставшиеся операторы
+    while (!ops.empty()) {
+        long b = values.top(); values.pop();
+        long a = values.top(); values.pop();
+        char top_op = ops.top(); ops.pop();
+        values.push(apply_op(a, b, top_op));
+    }
+
+    if (values.empty()) throw std::runtime_error("Empty expression");
+    return values.top();
+}
+
 // Генерация случайного арифметического выражения из n чисел
 std::string build_expression(int n, std::mt19937 &rng) {
-    std::uniform_int_distribution<int> dist_num(1, 10);       // числа от 1 до 10
-    std::uniform_int_distribution<int> dist_op(0, 3);         // операторы +, -, *, /
+    std::uniform_int_distribution<int> dist_num(1, 10); // числа от 1 до 10
+    std::uniform_int_distribution<int> dist_op(0, 3);   // операторы +, -, *, /
     const char ops[4] = {'+', '-', '*', '/'};
     std::ostringstream ss;
     for (int i = 0; i < n; ++i) {
         ss << dist_num(rng);
-        if (i + 1 < n) ss << ops[dist_op(rng)]; // добавляем оператор между числами
+        if (i + 1 < n) ss << ops[dist_op(rng)];
     }
     return ss.str();
-}
-
-// Локальное вычисление для проверки (логика идентична серверу)
-long evaluate(const std::string& expr) {
-    std::istringstream in(expr);
-    long result = 0, term = 0;
-    char op = '+';  // текущий оператор
-    while (true) {
-        long value;
-        if (!(in >> value)) break; // если не число - выходим
-        switch (op) {
-            case '+': result += (term = value); break;
-            case '-': result += (term = -value); break;
-            case '*': term *= value; break;
-            case '/': term = (value == 0 ? 0 : term / value); break;
-            default: break;
-        }
-        if (!(in >> op)) break; // считываем следующий оператор
-    }
-    return result;
 }
 
 // Структура для хранения состояния одного соединения
@@ -78,9 +123,9 @@ int main(int argc, char* argv[]) {
     int n = std::stoi(argv[1]);            // количество чисел
     int connections = std::stoi(argv[2]); // число параллельных сессий
     const char* server_addr = argv[3];     // адрес сервера
-    int server_port = std::stoi(argv[4]); // порт сервера
+    int server_port = std::stoi(argv[4]);  // порт сервера
 
-    // Создаем epoll-демон
+    // Создаем epoll‑демон
     int epoll_fd = epoll_create1(0);
     if (epoll_fd < 0) { perror("epoll_create1"); return 1; }
 
@@ -88,12 +133,11 @@ int main(int argc, char* argv[]) {
     std::mt19937 rng(static_cast<unsigned>(
         std::chrono::high_resolution_clock::now().time_since_epoch().count()));
 
-    std::unordered_map<int, Connection> conns;    // мапа fd -> Connection
-    std::vector<epoll_event> events(MAX_EVENTS); // массив для epoll_wait
+    std::unordered_map<int, Connection> conns;     // мапа fd -> Connection
+    std::vector<epoll_event> events(MAX_EVENTS);   // массив для epoll_wait
 
-    // Устанавливаем все соединения заранее
+    // Инициализируем все соединения
     for (int i = 0; i < connections; ++i) {
-        // Генерация и локальная проверка выражения
         Connection c;
         c.expr = build_expression(n, rng);
         c.expected = evaluate(c.expr);
@@ -102,7 +146,7 @@ int main(int argc, char* argv[]) {
 
         // Добавляем пробел в конце как разделитель
         std::string msg = c.expr + ' ';
-        
+
         // Фрагментация строки на случайные куски
         int pos = 0;
         while (pos < (int)msg.size()) {
@@ -132,10 +176,12 @@ int main(int argc, char* argv[]) {
     }
 
     int active = conns.size(); // сколько еще активных соединений
+
     // Основной цикл обработки событий
     while (active > 0) {
         int n_events = epoll_wait(epoll_fd, events.data(), MAX_EVENTS, -1);
-        if (n_events < 0 && errno == EINTR) continue; // пропустить сигнал
+        if (n_events < 0 && errno == EINTR) continue;
+
         for (int i = 0; i < n_events; ++i) {
             int fd = events[i].data.fd;
             uint32_t evs = events[i].events;
@@ -143,7 +189,7 @@ int main(int argc, char* argv[]) {
             if (it == conns.end()) continue;
             Connection &c = it->second;
 
-            // Если можно писать - отправляем фрагменты
+            // Отправка фрагментов при готовности записи
             if ((evs & EPOLLOUT) && c.frag_idx < c.fragments.size()) {
                 while (c.frag_idx < c.fragments.size()) {
                     const std::string &frag = c.fragments[c.frag_idx];
@@ -153,20 +199,19 @@ int main(int argc, char* argv[]) {
                     if (sent > 0) {
                         c.frag_offset += sent;
                         if (c.frag_offset == frag.size()) {
-                            c.frag_idx++; // переходим к следующему фрагменту
+                            c.frag_idx++;
                             c.frag_offset = 0;
                         }
                     } else if (sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                        break; // буфер записи полон
+                        break;
                     } else {
-                        // Ошибка - закрываем соединение
                         close(fd);
                         conns.erase(it);
                         active--;
                         goto next_fd;
                     }
                 }
-                // Если все фрагменты отправлены, выключаем EPOLLOUT
+                // Если все фрагменты отправлены — отключаем EPOLLOUT
                 if (c.frag_idx == c.fragments.size()) {
                     epoll_event mod{};
                     mod.data.fd = fd;
@@ -175,28 +220,25 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            // Если можно читать - получаем ответ
+            // Приём ответа при готовности чтения
             if (evs & EPOLLIN) {
                 char buf[64];
                 while (true) {
                     ssize_t count = recv(fd, buf, sizeof(buf), 0);
                     if (count > 0) {
                         c.in_buf.append(buf, count);
-                    } else if (count == 0) {
-                        // Сервер закрыл соединение
+                    } else if (count == 0 ||
+                              (count == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
                         break;
-                    } else if (count == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                        break; // прочитали все доступное
                     } else {
-                        break; // ошибка
+                        break;
                     }
                 }
-                // Проверяем разделитель пробел
+                // Проверяем разделитель (пробел)
                 size_t pos;
                 if ((pos = c.in_buf.find(' ')) != std::string::npos) {
                     std::string resp = c.in_buf.substr(0, pos);
                     long server_res = std::stol(resp);
-                    // Сравниваем с ожидаемым результатом
                     if (server_res != c.expected) {
                         std::cerr << "Mismatch! Expr: " << c.expr
                                   << ", Server: " << server_res
@@ -205,13 +247,12 @@ int main(int argc, char* argv[]) {
                         std::cout << "Match! Expr: " << c.expr
                                   << ", Result: " << server_res << std::endl;
                     }
-                    // Закрываем соединение после проверки
                     close(fd);
                     conns.erase(it);
                     active--;
                 }
             }
-            next_fd:;
+        next_fd:;
         }
     }
 
