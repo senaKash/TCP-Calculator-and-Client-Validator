@@ -13,10 +13,10 @@
 
 ```bash
 # Компиляция сервера
-g++ -std=c++17 -O2 server.cpp -o server
+g++ -std=c++17 -O2 tcp_server.cpp -o server
 
 # Компиляция клиента
-g++ -std=c++17 -O2 client.cpp -o client
+g++ -std=c++17 -O2 tcp_client.cpp -o client
 ```
 
 ## Запуск
